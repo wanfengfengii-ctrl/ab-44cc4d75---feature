@@ -9,9 +9,21 @@
 //  - 裁决顺序：总亮度最高 → 漏检段最少 → 输入顺序（逐帧采用斑点局部序号，
 //    再逐斑点母本全局序号）字典序稳定裁决。
 //
+// 终端后代平衡复核（可选，spec.balance.enabled）：
+//  - 每个分裂母本的两名女儿各自追溯到末帧的后代数 n1、n2 必须满足
+//    |n1 - n2| ≤ maxDiff；跨帧漏检只延续原分支（配额原样单传），
+//    嵌套分裂计入对应女儿的完整后代子树。
+//  - 做法：把「该支最终须占有的末帧后代数」作为下行配额随状态传播。
+//    根配额为终帧目标数；保持 / 漏检补获继承母本配额；分裂枚举满足
+//    n1 + n2 = 母本配额且差值不越限的有序整数对 (n1,n2)。斑点、连接与
+//    分裂拓扑在同一联合枚举内同步满足平衡约束，而非事后过滤最优解。
+//  - 关闭时配额一律为通配值 0，状态空间退化为原 (帧, 存活掩码, 漏检掩码,
+//    剩余额度)，草稿格式、求解结果与无解定位保持兼容。
+//
 // 位掩码动态规划：帧内斑点以位掩码表示；边界转移在「已占用女儿掩码 +
-// 新开漏检母本掩码」上做内层 DP，同一 (女儿集合, 漏检集合) 只保留字典序最小
-// 的母本配对，不展开母亲排列；状态 (帧, 存活掩码, 漏检掩码, 剩余额度) 备忘。
+// 新开漏检母本掩码 + 各女儿配额码」上做内层 DP，同一
+// (女儿集合, 漏检集合, 女儿配额) 只保留字典序最小的母本配对；状态
+// (帧, 存活掩码, 漏检掩码, 剩余额度, 存活配额码, 漏检配额码) 备忘。
 
 'use strict';
 
@@ -91,10 +103,25 @@ export function normalizeSpec(raw) {
     field('target', `终帧存活细胞数必须为 1 至末帧斑点数（${lastSize}）的整数`);
   }
 
+  // 终端后代平衡复核：默认关闭（兼容旧草稿）；启用时限值为非负整数。
+  const balanceEnabled = raw.balanceEnabled === true;
+  let balanceDiff = 0;
+  if (balanceEnabled) {
+    const d = raw.balanceDiff;
+    balanceDiff = Number(d);
+    if (d === '' || d === null || d === undefined ||
+        !Number.isInteger(balanceDiff) || balanceDiff < 0) {
+      field('balanceDiff', '启用终端后代平衡复核后，两侧终帧后代数最大差值必须为非负整数');
+    }
+  }
+
   if (errors.length) return { errors, spec: null };
   return {
     errors: [],
-    spec: { frames, startIndex, maxDist, maxSkip, target },
+    spec: {
+      frames, startIndex, maxDist, maxSkip, target,
+      balance: { enabled: balanceEnabled, maxDiff: balanceDiff },
+    },
   };
 }
 
@@ -118,6 +145,12 @@ function betterSignature(a, b) {
   return false;
 }
 
+// 配额以 4 位为单位编入整数码（末帧目标数 ≤ 8，每支配额 1..8）；
+// 0 为通配：平衡复核关闭时所有码位皆 0，行为与无配额模型完全一致。
+const WILD = 0;
+const nibAt = (code, pos) => (code >>> (4 * pos)) & 15;
+const withNib = (code, pos, n) => code | (n << (4 * pos));
+
 /**
  * 求解谱系。
  * @returns {object} 可行时 {feasible:true, ...}；不可行时
@@ -125,6 +158,9 @@ function betterSignature(a, b) {
  */
 export function solveLineage(spec) {
   const { frames, startIndex, maxDist, maxSkip, target } = spec;
+  const balance = spec.balance || { enabled: false, maxDiff: 0 };
+  const balOn = balance.enabled === true;
+  const maxDiff = balOn ? balance.maxDiff : 0;
   const F = frames.length;
   const sizes = frames.map((fr) => fr.length);
 
@@ -202,14 +238,17 @@ export function solveLineage(spec) {
 
   /**
    * 边界 t 的联合转移：存活母本（帧 t）与待补获漏检母本（帧 t-1）
-   * 共同在帧 t+1 上安排女儿。
-   * @returns {Map<number, Int8Array>} key = 女儿掩码*512 + 新开漏检母本掩码；
+   * 共同在帧 t+1 上安排女儿，并向下传递各支的终帧后代配额。
+   * @param {number} liveCode 存活母本配额码（nibAt(liveCode,mi) 为其配额）
+   * @param {number} gapCode 待补获漏检母本配额码
+   * @returns {Map<number, Int8Array>} key =
+   *   ((女儿配额码 * 512 + 女儿掩码) * 512 + 新开漏检母本掩码)；
    *   value 为按女儿序号排列的母本全局序号向量（-1 表示该女儿未被采用）。
    *   同一 key 只保留字典序最小的母本向量。
    */
   const expandMemo = new Map();
-  function expand(t, live, gaps) {
-    const key = (t << 20) | (live << 10) | gaps;
+  function expand(t, live, gaps, liveCode, gapCode) {
+    const key = `${t}|${live}|${gaps}|${liveCode}|${gapCode}`;
     const cached = expandMemo.get(key);
     if (cached) return cached;
 
@@ -229,23 +268,29 @@ export function solveLineage(spec) {
         }
       }
     };
+    const decodeKey = (k) => ({
+      opened: k % 512,
+      used: Math.floor(k / 512) % 512,
+      childCode: Math.floor(k / 262144),
+    });
 
-    // 1) 待补获漏检母本（帧 t-1）：恰一个跨帧女儿
+    // 1) 待补获漏检母本（帧 t-1）：恰一个跨帧女儿，配额原样单传
     const totalTracks = gapMoms.length + liveMoms.length;
     let processed = 0;
     for (const mi of gapMoms) {
       const gm = gi(t - 1, mi);
       const cap = near2[t - 1][mi];
+      const quota = nibAt(gapCode, mi) || WILD;
       const rest = totalTracks - processed - 1; // 尚未处理的母本，至少再贡献 1 支
       const ndp = new Map();
       for (const [state, mom] of dp) {
-        const used = Math.floor(state / 512);
+        const { used, opened, childCode } = decodeKey(state);
         for (const b of bits(cap & ~used)) {
           const bit = 1 << b;
-          if (popcnt(used | bit) + rest > target) continue;
+          if (popcnt(used | bit) + popcnt(opened) + rest > target) continue;
           const mom2 = mom.slice();
           mom2[b] = gm;
-          put(ndp, (used | bit) * 512, mom2);
+          put(ndp, (withNib(childCode, b, quota) * 512 + (used | bit)) * 512 + opened, mom2);
         }
       }
       dp = ndp;
@@ -257,13 +302,13 @@ export function solveLineage(spec) {
     for (const mi of liveMoms) {
       const gm = gi(t, mi);
       const miBit = 1 << mi;
+      const quota = nibAt(liveCode, mi) || WILD;
       const rest = totalTracks - processed - 1;
       const ndp = new Map();
       for (const [state, mom] of dp) {
-        const used = Math.floor(state / 512);
-        const opened = state % 512;
+        const { used, opened, childCode } = decodeKey(state);
 
-        // 2a) 保持
+        // 2a) 保持：女儿继承母本配额
         for (const bit of keepOpts[t][mi]) {
           if (used & bit) continue;
           const used2 = used | bit;
@@ -271,22 +316,34 @@ export function solveLineage(spec) {
           const b = Math.log2(bit);
           const mom2 = mom.slice();
           mom2[b] = gm;
-          put(ndp, used2 * 512 + opened, mom2);
+          put(ndp, (withNib(childCode, b, quota) * 512 + used2) * 512 + opened, mom2);
         }
-        // 2b) 分裂
+        // 2b) 分裂：两名女儿配额 n1/n2 为正整数、和为母本配额，
+        //     差值不得越过平衡限值（关闭复核时仅通配一种分法）。
         for (const pair of splitOpts[t][mi]) {
           if (used & pair) continue;
           const used2 = used | pair;
           if (popcnt(used2) + popcnt(opened) + rest > target) continue;
+          const [ba, bb] = bits(pair);
           const mom2 = mom.slice();
-          for (const b of bits(pair)) mom2[b] = gm;
-          put(ndp, used2 * 512 + opened, mom2);
+          mom2[ba] = gm;
+          mom2[bb] = gm;
+          if (!balOn) {
+            put(ndp, (childCode * 512 + used2) * 512 + opened, mom2);
+          } else if (quota >= 2) {
+            for (let n1 = 1; n1 < quota; n1++) {
+              const n2 = quota - n1;
+              if (Math.abs(n1 - n2) > maxDiff) continue;
+              const code2 = withNib(withNib(childCode, ba, n1), bb, n2);
+              put(ndp, (code2 * 512 + used2) * 512 + opened, mom2);
+            }
+          }
         }
-        // 2c) 本帧漏检（下一帧必须补获）
+        // 2c) 本帧漏检（下一帧必须补获）：配额随母本挂到 opened 上
         if (canOpen) {
           const opened2 = opened | miBit;
           if (popcnt(used) + popcnt(opened2) + rest <= target) {
-            put(ndp, used * 512 + opened2, mom);
+            put(ndp, (childCode * 512 + used) * 512 + opened2, mom);
           }
         }
       }
@@ -299,7 +356,8 @@ export function solveLineage(spec) {
   }
 
   const memo = new Map();
-  const stateKey = (t, live, gaps, left) => ((((t * 256 + live) * 256 + gaps) * 8) + left) * 31;
+  const stateKey = (t, live, gaps, left, liveCode, gapCode) =>
+    `${t}|${live}|${gaps}|${left}|${liveCode}|${gapCode}`;
 
   // 计数增长走廊：从 (live, gaps) 起，每步至多翻倍，漏检补获只能单传，
   // 判断末帧存活数能否达到目标。
@@ -313,18 +371,51 @@ export function solveLineage(spec) {
     return co >= target;
   }
 
+  // 配额增长上界：帧 t 的存活支还剩 R 次边界转移，至多 2^R 个末帧后代；
+  // 待补获漏检支首次转移只能单传，至多 2^(R-1) 个。
+  function quotasFeasible(t, liveCode, gapCode, liveCount, gapCount) {
+    if (!balOn) return true;
+    const R = F - 1 - t;
+    const liveMax = 1 << R;
+    for (let m = liveCount; m; m &= m - 1) {
+      const p = Math.log2(m & -m);
+      if (nibAt(liveCode, p) > liveMax) return false;
+    }
+    if (R >= 1) {
+      const gapMax = 1 << (R - 1);
+      for (let m = gapCount; m; m &= m - 1) {
+        const p = Math.log2(m & -m);
+        if (nibAt(gapCode, p) > gapMax) return false;
+      }
+    }
+    return true;
+  }
+
+  // 新开漏检母本在次状态中的漏检配额码：配额随母本原样延续
+  function openedGapCode(liveCode, opened) {
+    let code = 0;
+    for (const mi of bits(opened)) code = withNib(code, mi, nibAt(liveCode, mi) || WILD);
+    return code;
+  }
+
   // 返回从边界 t 到末帧的最优后缀，不可行返回 null
-  function solve(t, live, gaps, left) {
-    const key = stateKey(t, live, gaps, left);
+  function solve(t, live, gaps, left, liveCode, gapCode) {
+    const key = stateKey(t, live, gaps, left, liveCode, gapCode);
     if (memo.has(key)) return memo.get(key);
 
     const count = popcnt(live) + popcnt(gaps);
-    if (count > target || left < 0) {
+    if (count > target || left < 0 ||
+        !quotasFeasible(t, liveCode, gapCode, live, gaps)) {
       memo.set(key, null);
       return null;
     }
     if (t === F - 1) {
-      const leaf = gaps === 0 && popcnt(live) === target
+      let okLeaf = gaps === 0 && popcnt(live) === target;
+      if (okLeaf && balOn) {
+        // 末帧每条存活支恰占 1 个后代；配额和不变 ⇒ 配额必皆为 1
+        for (const i of bits(live)) if (nibAt(liveCode, i) !== 1) okLeaf = false;
+      }
+      const leaf = okLeaf
         ? { bright: 0, skips: 0, frames: [], pick: null, sub: null }
         : null;
       memo.set(key, leaf);
@@ -336,13 +427,15 @@ export function solveLineage(spec) {
     }
 
     let best = null;
-    for (const [state, mom] of expand(t, live, gaps)) {
-      const used = Math.floor(state / 512);
+    for (const [state, mom] of expand(t, live, gaps, liveCode, gapCode)) {
       const opened = state % 512;
+      const used = Math.floor(state / 512) % 512;
+      const childCode = Math.floor(state / 262144);
       const openCount = popcnt(opened);
       if (openCount > left) continue;
 
-      const sub = solve(t + 1, used, opened, left - openCount);
+      const sub = solve(t + 1, used, opened, left - openCount,
+        childCode, openedGapCode(liveCode, opened));
       if (!sub) continue;
 
       const usedBits = bits(used);
@@ -372,40 +465,51 @@ export function solveLineage(spec) {
   }
 
   const rootMask = 1 << startIndex;
-  const root = solve(0, rootMask, 0, maxSkip);
+  const rootCode = withNib(0, startIndex, balOn ? target : WILD);
+  const root = solve(0, rootMask, 0, maxSkip, rootCode, 0);
 
   if (!root) {
-    // 最早断开帧间：逐步前向展开可达状态，以局部必要存活条件（计数走廊、
-    // 漏检必须在补获帧有可达斑点、末帧计数恰为目标）筛选，找出首个
-    // 所有后继都无法存活的帧间。
-    const viable = (t, live, gaps, left) => {
+    // 最早断开帧间：逐步前向展开可达状态（含配额传播），以局部必要存活
+    // 条件（计数走廊、配额翻倍上界、漏检可达、末帧配额恰为 1）筛选，
+    // 找出首个所有后继都无法存活的帧间。
+    const viable = (t, live, gaps, left, liveCode, gapCode) => {
       if (left < 0) return false;
       if (popcnt(live) + popcnt(gaps) > target) return false;
-      if (t === F - 1) return gaps === 0 && popcnt(live) === target;
-      if (!canReachTarget(t, live, gaps)) return false;
-      if (t >= 1) {
-        for (const mi of bits(gaps)) {
-          if (near2[t - 1][mi] === 0) return false;
+      if (!quotasFeasible(t, liveCode, gapCode, live, gaps)) return false;
+      if (t === F - 1) {
+        if (gaps !== 0 || popcnt(live) !== target) return false;
+        if (balOn) {
+          for (const i of bits(live)) if (nibAt(liveCode, i) !== 1) return false;
         }
+        return true;
+      }
+      if (!canReachTarget(t, live, gaps)) return false;
+      for (const mi of bits(gaps)) {
+        if (near2[t - 1][mi] === 0) return false;
       }
       return true;
     };
 
     let reach = new Map();
-    if (viable(0, rootMask, 0, maxSkip)) {
-      reach.set(0, { live: rootMask, gaps: 0, left: maxSkip });
+    if (viable(0, rootMask, 0, maxSkip, rootCode, 0)) {
+      reach.set(`${rootMask}|0|${rootCode}|0`,
+        { live: rootMask, gaps: 0, left: maxSkip, liveCode: rootCode, gapCode: 0 });
     }
     let earliest = 0;
     for (let t = 0; t < F - 1; t++) {
       const next = new Map();
       for (const st of reach.values()) {
-        for (const state of expand(t, st.live, st.gaps).keys()) {
-          const used = Math.floor(state / 512);
+        for (const state of expand(t, st.live, st.gaps, st.liveCode, st.gapCode).keys()) {
           const opened = state % 512;
+          const used = Math.floor(state / 512) % 512;
+          const childCode = Math.floor(state / 262144);
           const nleft = st.left - popcnt(opened);
-          if (!viable(t + 1, used, opened, nleft)) continue;
-          const k = (used << 10) | opened;
-          if (!next.has(k)) next.set(k, { live: used, gaps: opened, left: nleft });
+          const gcode = openedGapCode(st.liveCode, opened);
+          if (!viable(t + 1, used, opened, nleft, childCode, gcode)) continue;
+          const k = `${used}|${opened}|${childCode}|${gcode}`;
+          if (!next.has(k)) {
+            next.set(k, { live: used, gaps: opened, left: nleft, liveCode: childCode, gapCode: gcode });
+          }
         }
       }
       if (next.size === 0) {
@@ -440,9 +544,43 @@ export function solveLineage(spec) {
 
   const usedPerFrame = Array.from({ length: F }, () => new Set());
   usedPerFrame[0].add(startIndex);
+  const childrenOf = new Map();
   for (const e of edges) {
     const { t, i } = decode(e.to);
     usedPerFrame[t].add(i);
+    if (!childrenOf.has(e.from)) childrenOf.set(e.from, []);
+    childrenOf.get(e.from).push(e.to);
+  }
+
+  // 终帧后代数：沿完整后代子树（含嵌套分裂与跨帧漏检延续）递归计数
+  const leafCache = new Map();
+  function leavesOf(g) {
+    if (leafCache.has(g)) return leafCache.get(g);
+    const { t } = decode(g);
+    const kids = childrenOf.get(g) || [];
+    const n = t === F - 1 ? 1 : kids.reduce((s, c) => s + leavesOf(c), 0);
+    leafCache.set(g, n);
+    return n;
+  }
+
+  let balanceReport = null;
+  if (balOn) {
+    const splits = [];
+    for (const [g, kids] of childrenOf) {
+      if (kids.length !== 2) continue;
+      const { t } = decode(g);
+      const ns = kids.map(leavesOf);
+      splits.push({
+        frame: t,
+        mother: g,
+        daughters: kids
+          .map((c, k) => ({ spot: c, leaves: ns[k] }))
+          .sort((a, b) => a.spot - b.spot),
+        diff: Math.abs(ns[0] - ns[1]),
+      });
+    }
+    splits.sort((a, b) => a.frame - b.frame || a.mother - b.mother);
+    balanceReport = { enabled: true, maxDiff, splits };
   }
 
   return {
@@ -453,6 +591,7 @@ export function solveLineage(spec) {
     survivors: target,
     edges,
     usedPerFrame: usedPerFrame.map((s) => [...s].sort((a, b) => a - b)),
+    balance: balanceReport,
     _decode: decode,
     _gi: gi,
   };
@@ -463,12 +602,16 @@ export function solveLineage(spec) {
  */
 export function presentSolution(spec, result) {
   if (!result.feasible) {
-    return {
+    const out = {
       feasible: false,
       earliestBreak: result.earliestBreak,
       earliestBreakLabel:
         `第 ${result.earliestBreak.from + 1} 帧 → 第 ${result.earliestBreak.to + 1} 帧`,
     };
+    if (spec.balance && spec.balance.enabled) {
+      out.balance = { enabled: true, maxDiff: spec.balance.maxDiff, splits: [] };
+    }
+    return out;
   }
   const { frames } = spec;
   const dec = result._decode;
@@ -496,7 +639,7 @@ export function presentSolution(spec, result) {
   let divisions = 0;
   for (const list of childrenOf.values()) if (list.length === 2) divisions++;
 
-  return {
+  const out = {
     feasible: true,
     totalBrightness: result.totalBrightness,
     skips: result.skips,
@@ -506,4 +649,24 @@ export function presentSolution(spec, result) {
     used: result.usedPerFrame.map((list, t) => list.map((i) => frames[t][i].id)),
     edges,
   };
+  if (result.balance) {
+    const nameOf = (g) => {
+      const { t, i } = dec(g);
+      return frames[t][i].id;
+    };
+    out.balance = {
+      enabled: true,
+      maxDiff: result.balance.maxDiff,
+      splits: result.balance.splits.map((r) => ({
+        frame: r.frame,
+        motherId: nameOf(r.mother),
+        diff: r.diff,
+        daughters: r.daughters.map((d) => {
+          const { t, i } = dec(d.spot);
+          return { frame: t, id: frames[t][i].id, leaves: d.leaves };
+        }),
+      })),
+    };
+  }
+  return out;
 }

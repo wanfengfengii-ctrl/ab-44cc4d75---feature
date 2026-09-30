@@ -427,3 +427,347 @@ test('随机对拍：小规模输入下与独立暴力枚举裁决一致', () =>
   }
   assert.ok(feasibleCases >= 30, `可行对拍用例过少: ${feasibleCases}`);
 });
+
+// ---------- 终端后代平衡复核 ----------
+
+// 校验解中每次分裂两侧的终帧后代数差均不越限，并与 balance 报告一致
+function assertBalanced(spec, sol, maxDiff) {
+  const F = spec.frames.length;
+  const kids = new Map(); // 't:id' -> 子节点 ['u:id']
+  for (const e of sol.edges) {
+    if (!kids.has(`${e.fromFrame}:${e.fromId}`)) kids.set(`${e.fromFrame}:${e.fromId}`, []);
+    kids.get(`${e.fromFrame}:${e.fromId}`).push(`${e.toFrame}:${e.toId}`);
+  }
+  const leaves = (key) => {
+    const [tStr, id] = key.split(':');
+    const t = Number(tStr);
+    const cs = kids.get(key) || [];
+    if (t === F - 1) { assert.equal(cs.length, 0); return 1; }
+    return cs.reduce((s, c) => s + leaves(c), 0);
+  };
+  for (const [key, cs] of kids) {
+    if (cs.length === 2) {
+      const n = cs.map(leaves);
+      assert.ok(Math.abs(n[0] - n[1]) <= maxDiff,
+        `分裂 ${key} 两侧终帧后代数 ${n.join('/')} 差值越过 ${maxDiff}`);
+    }
+  }
+  assert.ok(sol.balance && sol.balance.enabled, '结果应携带平衡复核报告');
+  assert.equal(sol.balance.maxDiff, maxDiff);
+  const reported = sol.balance.splits;
+  let splitCount = 0;
+  for (const cs of kids.values()) if (cs.length === 2) splitCount++;
+  assert.equal(reported.length, splitCount, '报告应逐次列出全部分裂');
+  for (const r of reported) {
+    assert.ok(r.diff <= maxDiff);
+    assert.equal(r.daughters.length, 2);
+    const momKey = `${r.frame}:${r.motherId}`;
+    const cs = (kids.get(momKey) || []).map((k) => k.split(':')[1]).sort();
+    assert.deepEqual(r.daughters.map((d) => d.id).sort(), cs);
+    const n = r.daughters.map((d) => d.leaves).sort((a, b) => a - b);
+    assert.equal(n[1] - n[0], r.diff);
+  }
+}
+
+const withBalance = (input, maxDiff) => ({
+  ...input,
+  balanceEnabled: true,
+  balanceDiff: maxDiff,
+});
+
+test('平衡复核：嵌套分裂高亮度偏斜方案被排除，改取 2/2 均衡低亮度方案', () => {
+  // 目标 4。亮簇固定在 y≈0（每点亮度 100），暗支沿 x 方向逐帧漂移到 x=24
+  // （每步位移恰为 maxDist=8），无法再碰到亮斑点。
+  // 偏斜最优：b 分裂为 c(3 叶，全亮) / d(1 叶，暗) —— 采用 3 个亮末帧叶；
+  // 均衡 2/2：c 两支各单传（2 亮叶），d 支末段分裂为两个暗叶。
+  const input = {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 1 }, { id: 'z0', x: 30, y: 30, b: 9 }],
+      [{ id: 'b', x: 0, y: 0, b: 1 }, { id: 'z1', x: 30, y: 30, b: 9 }],
+      [{ id: 'c', x: 0, y: 0, b: 100 }, { id: 'd', x: 8, y: 0, b: 1 }],
+      [
+        { id: 'c1', x: 0, y: 1, b: 100 },
+        { id: 'c2', x: 0, y: -1, b: 100 },
+        { id: 'd1', x: 16, y: 0, b: 1 },
+      ],
+      [
+        { id: 'e1', x: 0, y: 0, b: 100 },
+        { id: 'e2', x: 0, y: -1, b: 100 },
+        { id: 'e3', x: 0, y: 1, b: 100 },
+        { id: 'd2', x: 24, y: 0, b: 1 },
+      ],
+      [
+        { id: 'L1', x: 0, y: 0, b: 100 },
+        { id: 'L2', x: 0, y: -1, b: 100 },
+        { id: 'L3', x: 0, y: 1, b: 100 },
+        { id: 'g1', x: 24, y: 0, b: 1 },
+        { id: 'g2', x: 24, y: 1, b: 1 },
+      ],
+    ],
+    startId: 'a', maxDist: 8, maxSkip: 0, target: 4,
+  };
+
+  const off = run(input);
+  assertValidLineage(off.spec, off.sol, input);
+  assert.equal(off.sol.balance, undefined, '未启用时结果不携带平衡字段（兼容旧格式）');
+  // 无约束最优走 3/1 偏斜亮路径：末帧采用全部三个亮叶，暗支单传 g1
+  assert.deepEqual(off.sol.used[5].sort(), ['L1', 'L2', 'L3', 'g1']);
+
+  const on = run(withBalance(input, 0));
+  assertValidLineage(on.spec, on.sol, withBalance(input, 0));
+  assertBalanced(on.spec, on.sol, 0);
+  assert.ok(on.sol.totalBrightness < off.sol.totalBrightness,
+    '平衡约束下总亮度应低于偏斜最优（约束在求解时生效而非事后过滤）');
+  // 均衡解末帧为 2 亮叶 + 2 暗叶（暗支必须分裂）
+  const balLast = on.sol.used[5];
+  assert.equal(balLast.filter((id) => id.startsWith('L')).length, 2);
+  assert.deepEqual(balLast.filter((id) => id.startsWith('g')).sort(), ['g1', 'g2']);
+  // 报告按分裂帧排序，且包含嵌套分裂
+  const frames2 = on.sol.balance.splits.map((r) => r.frame);
+  assert.deepEqual(frames2, [...frames2].sort((a, b) => a - b));
+  assert.ok(on.sol.balance.splits.length >= 3, '应有 b、c、d2 三处分裂');
+});
+
+test('平衡复核：跨帧漏检只延续原分支配额（3 叶树，1/2 分裂 + 漏检后再分裂）', () => {
+  // a 在第 1 帧分裂为 c(1 叶) / d(2 叶)；c 全程单传；d 支在第 4→6 帧间漏检，
+  // 补获后再分裂为 e1/e2。两支列间距 8，超过跨帧补获半径 2×maxDist=6，
+  // 拓扑不会因同亮度稳定裁决而交叉。根分裂为 1/2（差 1）。
+  const input = {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 5 }, { id: 'z0', x: 30, y: 30, b: 9 }],
+      [{ id: 'c', x: 0, y: 0, b: 5 }, { id: 'd', x: 0, y: 2, b: 5 }],
+      [{ id: 'c2', x: 0, y: 0, b: 5 }, { id: 'd2', x: 0, y: 5, b: 5 }],
+      [{ id: 'c3', x: 0, y: 0, b: 5 }, { id: 'd3', x: 0, y: 8, b: 5 }],
+      [{ id: 'c4', x: 0, y: 0, b: 5 }, { id: 'j4', x: 30, y: 30, b: 99 }],
+      [{ id: 'c5', x: 0, y: 0, b: 5 }, { id: 'd5', x: 0, y: 8, b: 5 }],
+      [
+        { id: 'c6', x: 0, y: 0, b: 5 },
+        { id: 'e1', x: 0, y: 7, b: 5 },
+        { id: 'e2', x: 0, y: 9, b: 5 },
+      ],
+    ],
+    startId: 'a', maxDist: 3, maxSkip: 1, target: 3,
+  };
+  const loose = run(withBalance(input, 1));
+  assertValidLineage(loose.spec, loose.sol, withBalance(input, 1));
+  assertBalanced(loose.spec, loose.sol, 1);
+  assert.equal(loose.sol.skips, 1);
+  const gap = loose.sol.edges.find((e) => e.gap === 2);
+  assert.deepEqual({ f: gap.fromFrame, t: gap.toFrame, from: gap.fromId, to: gap.toId },
+    { f: 3, t: 5, from: 'd3', to: 'd5' });
+  const rootSplit = loose.sol.balance.splits.find((r) => r.frame === 0 && r.motherId === 'a');
+  assert.ok(rootSplit, '应列出根分裂 a');
+  assert.equal(rootSplit.daughters.find((q) => q.id === 'd').leaves, 2,
+    'd 支漏检后仍分裂，完整后代子树计 2 个终帧后代');
+  assert.equal(rootSplit.daughters.find((q) => q.id === 'c').leaves, 1);
+  assert.equal(rootSplit.diff, 1);
+  const tailSplit = loose.sol.balance.splits.find((r) => r.frame === 5 && r.motherId === 'd5');
+  assert.ok(tailSplit && tailSplit.diff === 0, '补获后 d5 应分裂为 e1/e2（1/1）');
+
+  const tight = run(withBalance(input, 0));
+  assert.equal(tight.raw.feasible, false, '限值 0 时 3 叶树必有 1/2 分裂，应不可行');
+  assert.equal(tight.sol.feasible, false);
+});
+
+test('平衡复核：限值 0 允许 4 叶均衡树；放宽限值不改变同亮度裁决', () => {
+  const input = {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 5 }, { id: 'z0', x: 30, y: 30, b: 9 }],
+      [{ id: 'b', x: 0, y: 0, b: 5 }, { id: 'z1', x: 30, y: 30, b: 9 }],
+      [{ id: 'c', x: 0, y: 0, b: 5 }, { id: 'd', x: 0, y: 2, b: 5 }],
+      [{ id: 'c1', x: 0, y: 0, b: 5 }, { id: 'c2', x: 0, y: 1, b: 5 },
+        { id: 'd1', x: 0, y: 2, b: 5 }, { id: 'd2', x: 0, y: 3, b: 5 }],
+      [
+        { id: 'L1', x: 0, y: 0, b: 5 }, { id: 'L2', x: 0, y: 1, b: 5 },
+        { id: 'L3', x: 0, y: 2, b: 5 }, { id: 'L4', x: 0, y: 3, b: 5 },
+      ],
+    ],
+    startId: 'a', maxDist: 3, maxSkip: 0, target: 4,
+  };
+  const r0 = run(withBalance(input, 0));
+  const r2 = run(withBalance(input, 2));
+  assertValidLineage(r0.spec, r0.sol, withBalance(input, 0));
+  assertBalanced(r0.spec, r0.sol, 0);
+  assert.deepEqual(r0.sol.used, r2.sol.used);
+  assert.equal(r0.sol.totalBrightness, r2.sol.totalBrightness);
+});
+
+test('平衡复核输入校验：启用时限值必须为非负整数；缺省字段视为关闭', () => {
+  const base = withBalance(base4(), 1);
+  assert.equal(normalizeSpec(base).errors.length, 0);
+  assert.equal(normalizeSpec({ ...base, balanceDiff: 0 }).spec.balance.enabled, true);
+  for (const bad of ['', -1, 1.5, null]) {
+    const r = normalizeSpec({ ...base, balanceDiff: bad });
+    assert.ok(r.errors.some((e) => e.field === 'balanceDiff'),
+      `限值 ${JSON.stringify(bad)} 应报错`);
+  }
+  const legacy = normalizeSpec(base4());
+  assert.equal(legacy.errors.length, 0);
+  assert.equal(legacy.spec.balance.enabled, false);
+});
+
+// ---------- 带平衡约束的独立暴力枚举对拍 ----------
+function bruteForceBalanced(spec, maxDiff) {
+  const { frames, startIndex, maxDist, maxSkip, target } = spec;
+  const F = frames.length;
+  const near = (m, c, gap) =>
+    Math.hypot(m.x - c.x, m.y - c.y) <= maxDist * gap + 1e-9;
+
+  let best = null;
+  const KEY = (t, i) => t * 16 + i;
+
+  function dfs(t, live, gaps, usedSkip, bright, usedPerFrame, parent) {
+    if (live.length + gaps.length > target) return;
+    if (t === F - 1) {
+      if (gaps.length > 0 || live.length !== target) return;
+      // 沿母女关系统计每支终帧后代数并检查全部分裂
+      const kids = new Map();
+      for (const [child, p] of parent) {
+        if (!kids.has(p)) kids.set(p, []);
+        kids.get(p).push(child);
+      }
+      const leafCache = new Map();
+      const leaves = (node) => {
+        if (leafCache.has(node)) return leafCache.get(node);
+        const ft = Math.floor(node / 16);
+        const cs = kids.get(node) || [];
+        const n = ft === F - 1 ? 1 : cs.reduce((s, c) => s + leaves(c), 0);
+        leafCache.set(node, n);
+        return n;
+      };
+      for (const [node, cs] of kids) {
+        if (cs.length === 2 && Math.abs(leaves(cs[0]) - leaves(cs[1])) > maxDiff) return;
+      }
+      const sig = usedPerFrame.slice(1).map((s) => [...s].sort((a, b) => a - b));
+      if (!best ||
+        bright > best.bright ||
+        (bright === best.bright &&
+          (usedSkip < best.skips ||
+            (usedSkip === best.skips && tupleLex(sig, best.sig) < 0)))) {
+        best = { bright, skips: usedSkip, sig };
+      }
+      return;
+    }
+
+    const tracks = [
+      ...live.map((i) => ({ kind: 'o', i })),
+      ...gaps.map((i) => ({ kind: 'g', i })),
+    ];
+    const claimed = new Set();
+    const nextLive = [];
+    const openGaps = [];
+
+    function rec(k, accBright) {
+      if (k === tracks.length) {
+        dfs(t + 1, nextLive.slice().sort((a, b) => a - b),
+          openGaps.slice().sort((a, b) => a - b),
+          usedSkip + openGaps.length, accBright, usedPerFrame, parent);
+        return;
+      }
+      const tr = tracks[k];
+      if (tr.kind === 'g') {
+        for (let j = 0; j < frames[t + 1].length; j++) {
+          if (claimed.has(j)) continue;
+          if (!near(frames[t - 1][tr.i], frames[t + 1][j], 2)) continue;
+          claimed.add(j); nextLive.push(j);
+          usedPerFrame[t + 1].add(j);
+          parent.set(KEY(t + 1, j), KEY(t - 1, tr.i));
+          rec(k + 1, accBright + frames[t + 1][j].b);
+          parent.delete(KEY(t + 1, j));
+          usedPerFrame[t + 1].delete(j);
+          nextLive.pop(); claimed.delete(j);
+        }
+        return;
+      }
+      const m = frames[t][tr.i];
+      for (let j = 0; j < frames[t + 1].length; j++) {
+        if (claimed.has(j) || !near(m, frames[t + 1][j], 1)) continue;
+        claimed.add(j); nextLive.push(j);
+        usedPerFrame[t + 1].add(j);
+        parent.set(KEY(t + 1, j), KEY(t, tr.i));
+        rec(k + 1, accBright + frames[t + 1][j].b);
+        parent.delete(KEY(t + 1, j));
+        usedPerFrame[t + 1].delete(j);
+        nextLive.pop(); claimed.delete(j);
+      }
+      for (let a = 0; a < frames[t + 1].length; a++) {
+        if (claimed.has(a) || !near(m, frames[t + 1][a], 1)) continue;
+        for (let b2 = a + 1; b2 < frames[t + 1].length; b2++) {
+          if (claimed.has(b2) || !near(m, frames[t + 1][b2], 1)) continue;
+          claimed.add(a); claimed.add(b2);
+          nextLive.push(a, b2);
+          usedPerFrame[t + 1].add(a); usedPerFrame[t + 1].add(b2);
+          parent.set(KEY(t + 1, a), KEY(t, tr.i));
+          parent.set(KEY(t + 1, b2), KEY(t, tr.i));
+          rec(k + 1, accBright + frames[t + 1][a].b + frames[t + 1][b2].b);
+          parent.delete(KEY(t + 1, a));
+          parent.delete(KEY(t + 1, b2));
+          usedPerFrame[t + 1].delete(a); usedPerFrame[t + 1].delete(b2);
+          nextLive.pop(); nextLive.pop();
+          claimed.delete(a); claimed.delete(b2);
+        }
+      }
+      if (usedSkip + openGaps.length < maxSkip && t + 2 <= F - 1) {
+        openGaps.push(tr.i);
+        rec(k + 1, accBright);
+        openGaps.pop();
+      }
+    }
+    rec(0, bright);
+  }
+
+  const used0 = Array.from({ length: F }, () => new Set());
+  used0[0].add(startIndex);
+  dfs(0, [startIndex], [], 0, frames[0][startIndex].b, used0, new Map());
+  return best;
+}
+
+test('随机对拍：启用平衡复核时与独立暴力枚举（含平衡过滤）裁决一致', () => {
+  const rand = rng(424242);
+  let feasibleCases = 0;
+  for (let iter = 0; iter < 3000 && feasibleCases < 150; iter++) {
+    const F = rand() < 0.4 ? 5 : 4;
+    const frames = [];
+    for (let t = 0; t < F; t++) {
+      const n = 2 + Math.floor(rand() * 2);
+      const fr = [];
+      for (let i = 0; i < n; i++) {
+        fr.push({
+          id: `b${t}_${i}`,
+          x: Math.floor(rand() * 3),
+          y: Math.floor(rand() * 3),
+          b: Math.floor(rand() * 9) + 1,
+        });
+      }
+      frames.push(fr);
+    }
+    const input = {
+      frames,
+      startId: frames[0][Math.floor(rand() * frames[0].length)].id,
+      maxDist: 1 + Math.floor(rand() * 3),
+      maxSkip: rand() < 0.5 ? 0 : 1,
+      target: 1 + Math.floor(rand() * 3),
+      balanceEnabled: true,
+      balanceDiff: rand() < 0.6 ? 0 : 1,
+    };
+    const { errors, spec } = normalizeSpec(input);
+    if (errors.length) continue;
+    const raw = solveLineage(spec);
+    const bf = bruteForceBalanced(spec, spec.balance.maxDiff);
+    if (!raw.feasible) {
+      assert.equal(bf, null, `迭代 ${iter}：求解器判不可行但暴力枚举存在平衡解`);
+      continue;
+    }
+    assert.ok(bf, `迭代 ${iter}：求解器给出平衡解但暴力枚举无解`);
+    feasibleCases++;
+    const sol = presentSolution(spec, raw);
+    assertValidLineage(spec, sol, input);
+    assertBalanced(spec, sol, spec.balance.maxDiff);
+    assert.equal(sol.totalBrightness, bf.bright, `迭代 ${iter} 总亮度不一致`);
+    assert.equal(sol.skips, bf.skips, `迭代 ${iter} 漏检数不一致`);
+    const sig = sol.used.slice(1).map((ids, t) =>
+      ids.map((id) => frames[t + 1].findIndex((s) => s.id === id)).sort((a, b) => a - b));
+    assert.equal(tupleLex(sig, bf.sig), 0, `迭代 ${iter} 输入顺序裁决不一致`);
+  }
+  assert.ok(feasibleCases >= 30, `平衡可行对拍用例过少: ${feasibleCases}`);
+});

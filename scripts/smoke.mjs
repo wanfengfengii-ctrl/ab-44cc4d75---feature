@@ -146,6 +146,56 @@ function checkScenario() {
     `总亮度应为 ${expectedBright}，实际 ${sol.totalBrightness}`);
   log(`谱系烟测通过：a→b →漏检→ c →(e1,e2)，总亮度 ${sol.totalBrightness}，位移表 ${sol.edges.length} 行`);
 
+  // 同一输入开启平衡复核：关闭/开启结果兼容（仅一处 1/1 分裂，差值 0）
+  const balInput = { ...input, balanceEnabled: true, balanceDiff: 0 };
+  const specB = normalizeSpec(balInput).spec;
+  const solB = presentSolution(specB, solveLineage(specB));
+  assert(solB.feasible === true, '开启平衡复核后原平衡场景应仍可行');
+  assert(solB.totalBrightness === sol.totalBrightness, '平衡复核不应改变本已平衡的最优谱系');
+  assert(solB.balance && solB.balance.enabled && solB.balance.maxDiff === 0,
+    '结果应携带平衡复核报告');
+  assert(solB.balance.splits.length === 1, `应逐次列出 1 次分裂，实际 ${solB.balance.splits?.length}`);
+  const bs = solB.balance.splits[0];
+  assert(bs.frame === 3 && bs.motherId === 'c', '分裂应为第 4 帧 c');
+  assert(bs.daughters.every((q) => q.leaves === 1) && bs.diff === 0,
+    `两名女儿终帧后代数应各为 1，实际 ${JSON.stringify(bs.daughters)}`);
+  log('平衡复核（限值 0）通过：逐次列出分裂帧、两名女儿及各自终帧后代数');
+
+  // 嵌套分裂 + 漏检的 3 叶树：d 支漏检后补获再分裂，根分裂为 1/2
+  const nested = {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 5 }, { id: 'z0', x: 30, y: 30, b: 9 }],
+      [{ id: 'c', x: 0, y: 0, b: 5 }, { id: 'd', x: 0, y: 2, b: 5 }],
+      [{ id: 'c2', x: 0, y: 0, b: 5 }, { id: 'd2', x: 0, y: 5, b: 5 }],
+      [{ id: 'c3', x: 0, y: 0, b: 5 }, { id: 'd3', x: 0, y: 8, b: 5 }],
+      [{ id: 'c4', x: 0, y: 0, b: 5 }, { id: 'j4', x: 30, y: 30, b: 99 }],
+      [{ id: 'c5', x: 0, y: 0, b: 5 }, { id: 'd5', x: 0, y: 8, b: 5 }],
+      [
+        { id: 'c6', x: 0, y: 0, b: 5 },
+        { id: 'e1', x: 0, y: 7, b: 5 },
+        { id: 'e2', x: 0, y: 9, b: 5 },
+      ],
+    ],
+    startId: 'a', maxDist: 3, maxSkip: 1, target: 3,
+  };
+  const specN1 = normalizeSpec({ ...nested, balanceEnabled: true, balanceDiff: 1 }).spec;
+  const solN1 = presentSolution(specN1, solveLineage(specN1));
+  assert(solN1.feasible === true, '限值 1 的嵌套分裂+漏检场景应可行');
+  assert(solN1.skips === 1 && solN1.divisions === 2, '应含 1 段漏检与 2 次分裂');
+  const root = solN1.balance.splits.find((r) => r.frame === 0 && r.motherId === 'a');
+  assert(root && root.diff === 1, '根分裂应为 1/2（差 1）');
+  assert(root.daughters.find((q) => q.id === 'd').leaves === 2,
+    'd 支跨帧漏检只延续原分支，嵌套分裂计入完整后代子树（2 个终帧后代）');
+  const tail = solN1.balance.splits.find((r) => r.motherId === 'd5');
+  assert(tail && tail.daughters.map((q) => q.leaves).join('/') === '1/1',
+    '补获后的 d5 应分裂为 1/1');
+  log('平衡复核（嵌套分裂 + 漏检延续）通过：d 支 2 个终帧后代、c 支 1 个');
+
+  const specN0 = normalizeSpec({ ...nested, balanceEnabled: true, balanceDiff: 0 }).spec;
+  const rawN0 = solveLineage(specN0);
+  assert(rawN0.feasible === false, '限值 0 时 3 叶树必有 1/2 分裂，应判不可行并保留草稿');
+  log('平衡限值收紧后不可行判定正确（终帧目标与平衡限值无法同时满足）');
+
   // 不可行场景：收紧位移使首帧间彻底断开，应报告最早断开为 帧1→帧2
   const tight = structuredClone(input);
   tight.maxDist = 2;

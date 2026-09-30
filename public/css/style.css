@@ -203,6 +203,68 @@ body {
 
 .params input:focus, .params select:focus { outline: none; border-color: var(--cyan); }
 
+.param {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.param.balance-toggle { grid-column: 1 / -1; }
+
+.balance-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.balance-row input[type="checkbox"] { width: auto; accent-color: var(--cyan); }
+
+.switch-label { font-size: 12px; color: var(--text); }
+
+.balance-row input[type="number"] {
+  width: 110px;
+  background: #111a27;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 9px;
+  font-size: 13px;
+}
+
+.balance-row input[type="number"]:disabled { opacity: .45; }
+
+.param small { color: var(--text-dim); font-size: 11px; }
+
+.balance-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.balance-row-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+}
+
+.balance-split { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.balance-mom { color: var(--purple); font-weight: 600; }
+.balance-arrow { color: var(--text-dim); }
+.balance-daughter { color: var(--text); }
+.balance-daughter b { color: var(--cyan); font-size: 14px; margin: 0 3px; }
+.balance-diff { border-radius: 5px; padding: 2px 9px; border: 1px solid var(--border); }
+.balance-diff.ok { color: var(--primary); border-color: var(--primary-d); }
+.balance-diff.bad { color: #f56565; border-color: #6b3042; }
+
 .actions {
   display: flex;
   align-items: center;

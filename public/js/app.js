@@ -34,6 +34,8 @@ const SAMPLE = {
   maxDist: 12,
   maxSkip: 1,
   target: 2,
+  balanceEnabled: false,
+  balanceDiff: 1,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -45,6 +47,8 @@ const els = {
   maxDist: $('#max-dist'),
   maxSkip: $('#max-skip'),
   target: $('#target'),
+  balanceEnabled: $('#balance-enabled'),
+  balanceDiff: $('#balance-diff'),
   solve: $('#btn-solve'),
   stale: $('#stale-hint'),
   errors: $('#form-errors'),
@@ -55,6 +59,8 @@ const els = {
   chart: $('#chart'),
   tbody: $('#edges-table tbody'),
   used: $('#used-list'),
+  balanceTitle: $('#balance-title'),
+  balanceList: $('#balance-list'),
 };
 
 let draft = loadDraft();
@@ -63,7 +69,16 @@ let lastSolution = null; // 仅保存最近一次「复原」的结果；编辑�
 function loadDraft() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const d = JSON.parse(raw);
+      // 兼容旧草稿：缺省平衡复核字段（默认关闭）
+      return {
+        ...structuredClone(SAMPLE),
+        ...d,
+        balanceEnabled: d.balanceEnabled === true,
+        balanceDiff: Number.isFinite(Number(d.balanceDiff)) ? d.balanceDiff : SAMPLE.balanceDiff,
+      };
+    }
   } catch { /* 忽略损坏草稿 */ }
   return structuredClone(SAMPLE);
 }
@@ -173,6 +188,9 @@ function renderParams() {
   els.maxDist.value = draft.maxDist;
   els.maxSkip.value = draft.maxSkip;
   els.target.value = draft.target;
+  els.balanceEnabled.checked = draft.balanceEnabled === true;
+  els.balanceDiff.value = draft.balanceDiff;
+  els.balanceDiff.disabled = !els.balanceEnabled.checked;
   renderStartOptions();
 }
 
@@ -193,6 +211,8 @@ function invalidate() {
     lastSolution = null;
     els.ok.classList.add('hidden');
     els.infeasible.classList.add('hidden');
+    els.balanceTitle.classList.add('hidden');
+    els.balanceList.classList.add('hidden');
     els.empty.classList.remove('hidden');
   }
   els.stale.classList.remove('hidden');
@@ -210,6 +230,8 @@ function solve() {
     showErrors(errors);
     els.ok.classList.add('hidden');
     els.infeasible.classList.add('hidden');
+    els.balanceTitle.classList.add('hidden');
+    els.balanceList.classList.add('hidden');
     els.empty.classList.remove('hidden');
     return;
   }
@@ -228,9 +250,12 @@ function solve() {
       els.infeasible.classList.add('hidden');
 
       if (!sol.feasible) {
+        const balanceMsg = spec.balance.enabled
+          ? `终帧存活目标（<b>${spec.target}</b>）、祖先唯一性、位移/漏检限制与终端后代平衡限值（两侧终帧后代数差 ≤ <b>${spec.balance.maxDiff}</b>）无法同时满足；输入草稿已保留，可调整后再次复原。`
+          : '终帧存活数与祖先唯一性、位移或漏检限制无法同时成立；输入草稿已保留，可调整后再次复原。';
         els.infeasible.innerHTML = `
           <strong>不存在可同时满足全部约束的谱系。</strong><br/>
-          终帧存活数与祖先唯一性、位移或漏检限制无法同时成立；输入草稿已保留，可调整后再次复原。<br/>
+          ${balanceMsg}<br/>
           最早断开的帧间：<span class="break-frame">第 ${sol.earliestBreak.from + 1} 帧 → 第 ${sol.earliestBreak.to + 1} 帧</span>`;
         els.infeasible.classList.remove('hidden');
         return;
@@ -259,9 +284,38 @@ function renderSolution(sol) {
   ].map(([k, v]) => `<span class="stat">${k}<b>${v}</b></span>`).join('');
 
   renderChart(sol);
+  renderBalance(sol);
   renderEdgesTable(sol);
   renderUsed(sol);
   els.ok.classList.remove('hidden');
+}
+
+// 终端后代平衡复核：按分裂帧逐次列出两名女儿及各自终帧后代数
+function renderBalance(sol) {
+  if (!sol.balance || !sol.balance.enabled) {
+    els.balanceTitle.classList.add('hidden');
+    els.balanceList.classList.add('hidden');
+    els.balanceList.innerHTML = '';
+    return;
+  }
+  els.balanceList.innerHTML = '';
+  sol.balance.splits.forEach((r) => {
+    const div = document.createElement('div');
+    div.className = 'balance-row-card';
+    const ds = r.daughters;
+    const ok = r.diff <= sol.balance.maxDiff;
+    div.innerHTML = `
+      <div class="balance-split">
+        <span class="balance-mom">F${r.frame + 1}·${escapeAttr(r.motherId)}</span>
+        <span class="balance-arrow">分裂 →</span>
+        <span class="balance-daughter">F${ds[0].frame + 1}·${escapeAttr(ds[0].id)}<b>${ds[0].leaves}</b> 个终帧后代</span>
+        <span class="balance-daughter">F${ds[1].frame + 1}·${escapeAttr(ds[1].id)}<b>${ds[1].leaves}</b> 个终帧后代</span>
+      </div>
+      <span class="balance-diff ${ok ? 'ok' : 'bad'}">差值 ${r.diff}（限值 ${sol.balance.maxDiff}）</span>`;
+    els.balanceList.appendChild(div);
+  });
+  els.balanceTitle.classList.remove('hidden');
+  els.balanceList.classList.remove('hidden');
 }
 
 function lookup() {
@@ -417,6 +471,16 @@ els.startSelect.addEventListener('change', () => {
       invalidate();
     });
   });
+
+els.balanceEnabled.addEventListener('change', () => {
+  draft.balanceEnabled = els.balanceEnabled.checked;
+  els.balanceDiff.disabled = !draft.balanceEnabled;
+  invalidate();
+});
+els.balanceDiff.addEventListener('input', () => {
+  draft.balanceDiff = els.balanceDiff.value === '' ? '' : Number(els.balanceDiff.value);
+  invalidate();
+});
 
 els.solve.addEventListener('click', solve);
 

@@ -40,6 +40,15 @@
           终帧应存活细胞数
           <input type="number" id="target" min="1" step="1" />
         </label>
+        <div class="param balance-toggle">
+          <label for="balance-enabled">终端后代平衡复核（按需启用）</label>
+          <span class="balance-row">
+            <input type="checkbox" id="balance-enabled" />
+            <label for="balance-enabled" class="switch-label">启用</label>
+            <input type="number" id="balance-diff" min="0" step="1" placeholder="最大差值" />
+          </span>
+          <small>启用后每次分裂的两名女儿追溯到末帧的后代数之差不得超过此限值。</small>
+        </div>
       </div>
 
       <div class="actions">
@@ -63,6 +72,8 @@
           <span><i class="ring"></i>起始斑点</span>
         </div>
         <div id="chart"></div>
+        <h3 id="balance-title" class="hidden">终端后代平衡复核</h3>
+        <div id="balance-list" class="balance-list hidden"></div>
         <h3>逐段连接与位移</h3>
         <div class="table-wrap">
           <table id="edges-table">
