@@ -40,6 +40,17 @@
           终帧应存活细胞数
           <input type="number" id="target" min="1" step="1" />
         </label>
+        <div class="param-block balance-toggle">
+          <span class="param-caption">终端后代平衡复核</span>
+          <span class="switch-row">
+            <input type="checkbox" id="balance-enabled" />
+            <label for="balance-enabled" class="switch-label">启用：每次分裂的两名女儿终帧后代数之差不得越限</label>
+          </span>
+        </div>
+        <label id="balance-limit-wrap" class="hidden">
+          分裂两侧终帧后代数最大差值
+          <input type="number" id="balance-limit" min="0" step="1" />
+        </label>
       </div>
 
       <div class="actions">
@@ -55,6 +66,7 @@
       <div id="result-infeasible" class="result-banner infeasible hidden"></div>
       <div id="result-ok" class="hidden">
         <div class="stats" id="stats"></div>
+        <div id="balance-review" class="balance-review hidden"></div>
         <div class="legend">
           <span><i class="sw solid"></i>母女连线</span>
           <span><i class="sw dashed"></i>漏检段（跨一帧）</span>

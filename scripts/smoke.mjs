@@ -157,6 +157,85 @@ function checkScenario() {
   log('不可行报告正确：最早断开 第 1 帧 → 第 2 帧');
 }
 
+// 终端后代平衡复核（含嵌套分裂 + 跨帧漏检）：
+// 帧0 a → 帧1 m → 帧2 分裂为 c1/c2；c1→帧3 d1→帧4 分裂 e1/e2（嵌套 2 叶）；
+// c2 在帧3 整帧漏检，帧4 补获为 e3（跨帧漏检只延续原支，1 叶）。
+// 顶层分裂两侧终帧叶数为 2|1：限值 0 不可行，限值 1 可行。
+function balanceScenario() {
+  return {
+    frames: [
+      [
+        { id: 'a', x: 0, y: 0, b: 10 },
+        { id: 'za', x: 9, y: 9, b: 0 },
+      ],
+      [
+        { id: 'm', x: 1, y: 0, b: 10 },
+        { id: 'zm', x: 9, y: 9, b: 0 },
+      ],
+      [
+        { id: 'c1', x: 2, y: -1, b: 10 },
+        { id: 'c2', x: 2, y: 1, b: 10 },
+      ],
+      [
+        { id: 'd1', x: 3, y: -1, b: 10 },
+        { id: 'zz', x: 9, y: 9, b: 99 },
+      ],
+      [
+        { id: 'e1', x: 4, y: -2, b: 10 },
+        { id: 'e2', x: 4, y: 0, b: 10 },
+        { id: 'e3', x: 4, y: 1, b: 10 },
+      ],
+    ],
+    startId: 'a',
+    maxDist: 2,
+    maxSkip: 1,
+    target: 3,
+  };
+}
+
+function checkBalanceScenario() {
+  const assert = (cond, msg) => { if (!cond) fail(msg); };
+  const input = balanceScenario();
+
+  const tight = normalizeSpec({ ...input, balanceEnabled: true, balanceLimit: 0 });
+  if (tight.errors.length) fail(`平衡场景输入校验失败: ${JSON.stringify(tight.errors)}`);
+  const rawTight = solveLineage(tight.spec);
+  assert(rawTight.feasible === false, '嵌套 2|1 分裂在限值 0 下应不可行（约束须在枚举内同步）');
+  const solTight = presentSolution(tight.spec, rawTight);
+  assert(solTight.balanceEnabled === true && solTight.balanceLimit === 0,
+    '不可行结果应保留平衡开关与限值');
+  log(`平衡限值 0 正确判不可行：最早断开 ${solTight.earliestBreakLabel}`);
+
+  const loose = normalizeSpec({ ...input, balanceEnabled: true, balanceLimit: 1 });
+  const raw = solveLineage(loose.spec);
+  if (!raw.feasible) fail(`平衡限值 1 场景被误判不可行: ${JSON.stringify(raw.earliestBreak)}`);
+  const sol = presentSolution(loose.spec, raw);
+  assert(sol.skips === 1, `应有一次跨帧漏检，实际 ${sol.skips}`);
+  assert(sol.divisions === 2, `应有两次分裂（含嵌套），实际 ${sol.divisions}`);
+  assert(sol.divisionDetails.length === 2, '分裂明细应逐次列出两次');
+
+  const byMother = new Map(sol.divisionDetails.map((d) => [d.motherId, d]));
+  const top = byMother.get('m');
+  assert(top, '明细应包含帧2 母本 m 的分裂');
+  const leaves = top.daughters.map((x) => x.terminalLeaves).sort((a, b) => a - b);
+  assert(JSON.stringify(leaves) === '[1,2]',
+    `m 两侧终帧后代应为 1 与 2（嵌套+漏检），实际 ${JSON.stringify(leaves)}`);
+  assert(top.leafDiff === 1, `m 两侧差值应为 1，实际 ${top.leafDiff}`);
+  const nested = byMother.get('d1');
+  assert(nested && nested.leafDiff === 0, '嵌套分裂 d1 两侧应各 1 叶、差值 0');
+  for (const d of sol.divisionDetails) assert(d.leafDiff <= 1, '所有分裂差值不得越限');
+  log(`平衡烟测通过：m 分裂两侧终帧后代 ${leaves[0]}|${leaves[1]}，` +
+    `嵌套 d1 为 1|1，漏检 ${sol.skips} 段`);
+
+  // 关闭复核时同输入同样可行，且结果不携带限值
+  const off = normalizeSpec(input);
+  const solOff = presentSolution(off.spec, solveLineage(off.spec));
+  assert(solOff.feasible === true && solOff.balanceEnabled === false,
+    '关闭复核时结果应可行且不带平衡标记');
+  assert(solOff.divisionDetails.length === 2, '关闭时仍应列出分裂叶数明细');
+  log('关闭复核时格式与求解兼容，分裂明细照常给出');
+}
+
 async function main() {
   let base = BASE_URL;
   if (process.env.BASE_URL) {
@@ -174,6 +253,7 @@ async function main() {
   await waitHealthy(base);
   await checkStatic(base);
   checkScenario();
+  checkBalanceScenario();
   log('全部烟测通过 ✔');
   if (ownServer) ownServer.kill('SIGTERM');
   if (portFile && existsSync(portFile)) rmSync(portFile);

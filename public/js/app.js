@@ -34,6 +34,8 @@ const SAMPLE = {
   maxDist: 12,
   maxSkip: 1,
   target: 2,
+  balanceEnabled: false,
+  balanceLimit: 0,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -45,6 +47,9 @@ const els = {
   maxDist: $('#max-dist'),
   maxSkip: $('#max-skip'),
   target: $('#target'),
+  balanceEnabled: $('#balance-enabled'),
+  balanceLimit: $('#balance-limit'),
+  balanceLimitWrap: $('#balance-limit-wrap'),
   solve: $('#btn-solve'),
   stale: $('#stale-hint'),
   errors: $('#form-errors'),
@@ -52,6 +57,7 @@ const els = {
   infeasible: $('#result-infeasible'),
   ok: $('#result-ok'),
   stats: $('#stats'),
+  balanceReview: $('#balance-review'),
   chart: $('#chart'),
   tbody: $('#edges-table tbody'),
   used: $('#used-list'),
@@ -63,9 +69,18 @@ let lastSolution = null; // 仅保存最近一次「复原」的结果；编辑�
 function loadDraft() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) return withBalanceDefaults(JSON.parse(raw));
   } catch { /* 忽略损坏草稿 */ }
   return structuredClone(SAMPLE);
+}
+
+// 旧草稿（v1 及之前）无平衡字段：默认关闭复核，限值 0。
+function withBalanceDefaults(d) {
+  if (d && typeof d === 'object') {
+    if (typeof d.balanceEnabled !== 'boolean') d.balanceEnabled = false;
+    if (!Number.isInteger(d.balanceLimit)) d.balanceLimit = 0;
+  }
+  return d;
 }
 
 function saveDraft() {
@@ -173,6 +188,9 @@ function renderParams() {
   els.maxDist.value = draft.maxDist;
   els.maxSkip.value = draft.maxSkip;
   els.target.value = draft.target;
+  els.balanceEnabled.checked = draft.balanceEnabled === true;
+  els.balanceLimit.value = draft.balanceLimit;
+  els.balanceLimitWrap.classList.toggle('hidden', !draft.balanceEnabled);
   renderStartOptions();
 }
 
@@ -228,9 +246,13 @@ function solve() {
       els.infeasible.classList.add('hidden');
 
       if (!sol.feasible) {
+        const balNote = sol.balanceEnabled
+          ? `终帧目标（${draft.target} 个存活细胞）与平衡限值（分裂两侧终帧后代数之差 ≤ ${draft.balanceLimit}）` +
+            '及祖先唯一性、位移、漏检等约束无法同时满足；'
+          : '终帧存活数与祖先唯一性、位移或漏检限制无法同时成立；';
         els.infeasible.innerHTML = `
           <strong>不存在可同时满足全部约束的谱系。</strong><br/>
-          终帧存活数与祖先唯一性、位移或漏检限制无法同时成立；输入草稿已保留，可调整后再次复原。<br/>
+          ${balNote}输入草稿已保留，可调整后再次复原。<br/>
           最早断开的帧间：<span class="break-frame">第 ${sol.earliestBreak.from + 1} 帧 → 第 ${sol.earliestBreak.to + 1} 帧</span>`;
         els.infeasible.classList.remove('hidden');
         return;
@@ -260,8 +282,46 @@ function renderSolution(sol) {
 
   renderChart(sol);
   renderEdgesTable(sol);
+  renderBalanceReview(sol);
   renderUsed(sol);
   els.ok.classList.remove('hidden');
+}
+
+// 逐次列出：分裂帧、母本、两名女儿及各自终帧后代数。
+function renderBalanceReview(sol) {
+  const box = els.balanceReview;
+  if (!sol.divisionDetails || sol.divisionDetails.length === 0) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  const head = sol.balanceEnabled
+    ? `<h3>终端后代平衡复核</h3>
+       <p class="balance-sub">已在联合选择斑点、连接与分裂拓扑时同步满足：
+       每次分裂两侧终帧后代数之差 ≤ <b>${sol.balanceLimit}</b>。</p>`
+    : `<h3>各分裂的终帧后代数</h3>
+       <p class="balance-sub">未启用平衡复核；下列叶数仅为谱系说明（嵌套分裂计入对应女儿子树，跨帧漏检只延续原分支）。</p>`;
+  const rows = sol.divisionDetails.map((d, idx) => {
+    const badge = sol.balanceEnabled
+      ? `<span class="bal-badge ${d.leafDiff <= sol.balanceLimit ? 'ok' : 'bad'}">差值 ${d.leafDiff}${d.leafDiff <= sol.balanceLimit ? ' ✓' : ''}</span>`
+      : `<span class="bal-badge">差值 ${d.leafDiff}</span>`;
+    const [c1, c2] = d.daughters;
+    return `
+      <li>
+        <div class="bal-title">
+          <span class="bal-idx">#${idx + 1}</span>
+          <span>第 ${d.frame + 1} 帧 · 母本 <b>${escapeAttr(d.motherId)}</b> 分裂</span>
+          ${badge}
+        </div>
+        <div class="bal-daughters">
+          <span>女儿 F${c1.frame + 1}·${escapeAttr(c1.id)} <em>终帧后代 <b>${c1.terminalLeaves}</b></em></span>
+          <span class="bal-vs">⇆</span>
+          <span>女儿 F${c2.frame + 1}·${escapeAttr(c2.id)} <em>终帧后代 <b>${c2.terminalLeaves}</b></em></span>
+        </div>
+      </li>`;
+  }).join('');
+  box.innerHTML = `${head}<ol class="balance-list">${rows}</ol>`;
+  box.classList.remove('hidden');
 }
 
 function lookup() {
@@ -410,13 +470,20 @@ els.startSelect.addEventListener('change', () => {
   draft.startId = els.startSelect.value;
   invalidate();
 });
-[['maxDist', els.maxDist], ['maxSkip', els.maxSkip], ['target', els.target]]
+[['maxDist', els.maxDist], ['maxSkip', els.maxSkip], ['target', els.target],
+  ['balanceLimit', els.balanceLimit]]
   .forEach(([k, input]) => {
     input.addEventListener('input', () => {
       draft[k] = input.value === '' ? '' : Number(input.value);
       invalidate();
     });
   });
+
+els.balanceEnabled.addEventListener('change', () => {
+  draft.balanceEnabled = els.balanceEnabled.checked;
+  els.balanceLimitWrap.classList.toggle('hidden', !draft.balanceEnabled);
+  invalidate();
+});
 
 els.solve.addEventListener('click', solve);
 

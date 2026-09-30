@@ -203,6 +203,29 @@ body {
 
 .params input:focus, .params select:focus { outline: none; border-color: var(--cyan); }
 
+.param-block {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.param-caption { font-size: 12px; color: var(--text-dim); }
+
+.switch-row { display: flex; align-items: flex-start; gap: 8px; }
+
+.switch-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--cyan);
+  cursor: pointer;
+}
+
+.switch-label { font-size: 12.5px; color: var(--text); cursor: pointer; }
+
 .actions {
   display: flex;
   align-items: center;
@@ -351,3 +374,43 @@ tr.divide-row td { color: var(--purple); }
 .used-frame b { display: block; margin-bottom: 4px; }
 .used-frame span { color: var(--cyan); margin-right: 6px; }
 .used-frame em { color: var(--text-dim); font-style: normal; }
+
+.balance-review {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px 12px;
+  margin-bottom: 12px;
+}
+
+.balance-sub { margin: 4px 0 8px; font-size: 12px; color: var(--text-dim); }
+.balance-sub b { color: var(--yellow); }
+
+.balance-list { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 8px; }
+
+.balance-list li {
+  background: #111a27;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12.5px;
+}
+
+.bal-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bal-idx { color: var(--text-dim); font-size: 11.5px; }
+.bal-daughters { display: flex; align-items: center; gap: 12px; margin-top: 4px; color: var(--text); flex-wrap: wrap; }
+.bal-daughters em { font-style: normal; color: var(--text-dim); margin-left: 4px; }
+.bal-daughters b { color: var(--cyan); }
+.bal-vs { color: var(--purple); font-weight: 700; }
+
+.bal-badge {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.bal-badge.ok { color: var(--cyan); border-color: var(--cyan); }
+.bal-badge.bad { color: #feb2b2; border-color: #6b3042; background: var(--danger-bg); }

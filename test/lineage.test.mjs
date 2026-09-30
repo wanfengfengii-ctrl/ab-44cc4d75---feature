@@ -270,6 +270,154 @@ test('输入校验：帧数、斑点数、重复编号、参数范围', () => {
   assert.ok(normalizeSpec(badTarget).errors.some((e) => e.field === 'target'));
 });
 
+// ---------- 终端后代平衡复核 ----------
+// 末帧 3 叶、5 帧：c 在帧3 分裂为 p1/p2，p1 在帧4 再分裂；任意外层分裂
+// 必然 2|1，限值 0 应判不可行，限值 1 可行。
+function nested3() {
+  return {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 10 }, { id: 'z0', x: 9, y: 9, b: 99 }],
+      [{ id: 'b', x: 1, y: 0, b: 10 }, { id: 'z1', x: 9, y: 9, b: 99 }],
+      [{ id: 'c', x: 2, y: 0, b: 10 }, { id: 'z2', x: 9, y: 9, b: 99 }],
+      [
+        { id: 'p1', x: 3, y: -1, b: 10 },
+        { id: 'p2', x: 3, y: 1, b: 10 },
+        { id: 'z3', x: 9, y: 9, b: 99 },
+      ],
+      [
+        { id: 'r1', x: 4, y: -2, b: 10 },
+        { id: 'r2', x: 4, y: 0, b: 10 },
+        { id: 'r3', x: 4, y: 2, b: 10 },
+      ],
+    ],
+    startId: 'a', maxDist: 3, maxSkip: 0, target: 3,
+  };
+}
+
+test('平衡复核默认关闭：spec 不含启用标记，结果与旧格式兼容', () => {
+  const { spec } = normalizeSpec(nested3());
+  assert.equal(spec.balanceEnabled, false);
+  const r = run(nested3());
+  assert.equal(r.raw.feasible, true);
+  assert.equal(r.sol.balanceEnabled, false);
+  assert.equal(r.sol.balanceLimit, null);
+});
+
+test('平衡限值校验：启用时必须为 0 至末帧斑点数-1 的整数', () => {
+  const ok = normalizeSpec({ ...nested3(), balanceEnabled: true, balanceLimit: 2 });
+  assert.deepEqual(ok.errors, []);
+  assert.equal(ok.spec.balanceLimit, 2);
+  for (const v of [-1, 3, 1.5, 'x', null]) {
+    const bad = normalizeSpec({ ...nested3(), balanceEnabled: true, balanceLimit: v });
+    assert.ok(bad.errors.some((e) => e.field === 'balanceLimit'), `限值 ${v} 应被拒绝`);
+  }
+  // 未启用时限值字段不参与校验
+  assert.deepEqual(normalizeSpec({ ...nested3(), balanceLimit: 'garbage' }).errors, []);
+});
+
+test('限值 0：含不平衡分裂时不可行（约束在枚举内同步，而非事后过滤）', () => {
+  const tight = run({ ...nested3(), balanceEnabled: true, balanceLimit: 0 });
+  assert.equal(tight.raw.feasible, false);
+  assert.equal(tight.sol.feasible, false);
+  assert.equal(tight.sol.balanceEnabled, true);
+  assert.equal(tight.sol.balanceLimit, 0);
+  // 断点定位仍给出合法帧间
+  assert.ok(tight.raw.earliestBreak.from >= 0);
+  assert.ok(tight.raw.earliestBreak.to <= 4);
+});
+
+test('限值放宽到 1：同一输入可行，且逐分裂叶数差不越限', () => {
+  const loose = run({ ...nested3(), balanceEnabled: true, balanceLimit: 1 });
+  assert.equal(loose.raw.feasible, true);
+  assertValidLineage(loose.spec, loose.sol, { ...nested3(), balanceEnabled: true, balanceLimit: 1 });
+  assert.ok(loose.sol.divisionDetails.length >= 1);
+  for (const d of loose.sol.divisionDetails) {
+    assert.ok(d.leafDiff <= 1, `分裂差值 ${d.leafDiff} 越过限值 1`);
+    assert.equal(d.daughters.length, 2);
+    assert.equal(Math.abs(d.daughters[0].terminalLeaves - d.daughters[1].terminalLeaves), d.leafDiff);
+  }
+  // 外层分裂 c 的两名女儿终帧叶数为 2 与 1（嵌套分裂计入完整子树）
+  const top = loose.sol.divisionDetails.find((d) => d.motherId === 'c');
+  assert.ok(top);
+  assert.deepEqual(top.daughters.map((x) => x.terminalLeaves).sort((a, b) => a - b), [1, 2]);
+  assert.equal(top.leafDiff, 1);
+});
+
+test('跨帧漏检只延续原分支：叶数计入漏检母本所在一侧', () => {
+  const input = {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 10 }, { id: 'za', x: 9, y: 9, b: 0 }],
+      [{ id: 'm', x: 1, y: 0, b: 10 }, { id: 'zm', x: 9, y: 9, b: 0 }],
+      [
+        { id: 'c1', x: 2, y: -1, b: 10 },
+        { id: 'c2', x: 2, y: 1, b: 10 },
+      ],
+      [
+        { id: 'd1', x: 3, y: -1, b: 10 },
+        { id: 'zz', x: 9, y: 9, b: 99 }, // c2 在帧3 无近邻 → 整帧漏检
+      ],
+      [
+        { id: 'e1', x: 4, y: -2, b: 10 },
+        { id: 'e2', x: 4, y: 0, b: 10 },
+        { id: 'e3', x: 4, y: 1, b: 10 },
+      ],
+    ],
+    startId: 'a', maxDist: 2, maxSkip: 1, target: 3,
+  };
+  const loose = run({ ...input, balanceEnabled: true, balanceLimit: 1 });
+  assert.equal(loose.raw.feasible, true);
+  assert.equal(loose.sol.skips, 1);
+  const top = loose.sol.divisionDetails.find((d) => d.motherId === 'm');
+  assert.deepEqual(top.daughters.map((x) => x.terminalLeaves).sort((a, b) => a - b), [1, 2]);
+  // c2 经漏检延续为单支 e3；其女儿条目指向帧2 的 c2（漏检不改母女拓扑）
+  const side = top.daughters.find((x) => x.id === 'c2');
+  assert.ok(side && side.terminalLeaves === 1);
+  const tight = run({ ...input, balanceEnabled: true, balanceLimit: 0 });
+  assert.equal(tight.raw.feasible, false);
+});
+
+test('平衡约束改变联合最优：亮方案不达标时改取达标拓扑，而非先最优后过滤', () => {
+  // 无约束最优的顶层分裂为 3|1（差 2）；限值 0 时必须改取 2|2 的另一拓扑
+  const input = {
+    frames: [
+      [{ id: 'a', x: 0, y: 0, b: 0 }, { id: 'za', x: 9, y: 9, b: 0 }],
+      [{ id: 'm', x: 1, y: 0, b: 0 }, { id: 'zm', x: 9, y: 9, b: 0 }],
+      [
+        { id: 'c1', x: 2, y: -1, b: 0 },
+        { id: 'c2', x: 2, y: 1, b: 0 },
+      ],
+      [
+        { id: 'p1', x: 3, y: -2, b: 0 },
+        { id: 'p2', x: 3, y: 0, b: 0 },
+        { id: 'q1', x: 3, y: 2, b: 0 },
+        { id: 'q2', x: 4, y: 2, b: 0 },
+      ],
+      [
+        { id: 'r1', x: 4, y: -3, b: 100 },
+        { id: 'r2', x: 5, y: -1, b: 100 },
+        { id: 'r3', x: 4, y: 1, b: 100 },
+        { id: 'r4', x: 4, y: 3, b: 1 },
+        { id: 'r5', x: 5, y: 3, b: 1 },
+      ],
+    ],
+    startId: 'a', maxDist: 3, maxSkip: 0, target: 4,
+  };
+  const off = run(input);
+  assert.equal(off.sol.divisionDetails[0].leafDiff, 2);
+  const bal = run({ ...input, balanceEnabled: true, balanceLimit: 0 });
+  assert.equal(bal.raw.feasible, true);
+  assert.deepEqual(bal.sol.divisionDetails.map((d) => d.leafDiff), [0, 0, 0]);
+  // 拓扑确实不同（顶层女儿的叶数分配改变）
+  assert.deepEqual(bal.sol.divisionDetails[0].daughters.map((x) => x.terminalLeaves), [2, 2]);
+});
+
+test('divisionDetails 始终提供（未启用时也列出分裂帧与两侧叶数），按帧排列', () => {
+  const { sol } = run(nested3());
+  const frames = sol.divisionDetails.map((d) => d.frame);
+  assert.deepEqual(frames, [...frames].sort((a, b) => a - b));
+  assert.equal(sol.divisions, sol.divisionDetails.length);
+});
+
 // ---------- 独立暴力枚举：逐帧 DFS 穷举全部可行谱系（无备忘、无剪枝界） ----------
 function bruteForce(spec) {
   const { frames, startIndex, maxDist, maxSkip, target } = spec;
